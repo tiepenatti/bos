@@ -1,0 +1,16 @@
+---
+description: Free-tier hosting constraints for BOS project
+alwaysApply: true
+---
+
+# Free Tier Constraints
+
+This project must run entirely on free tiers. See AGENTS.md for full details.
+
+Key rules:
+- Backend storage is **ephemeral only** — use `backend/tmp/` (local filesystem), never external object storage.
+- No paid services: no S3, Redis, Celery workers, or paid APIs.
+- Background cleanup must be in-process (`BackgroundTasks` or `asyncio.create_task`).
+- Frontend must produce a **static build** to `frontend/dist/` for GitHub Pages.
+- Keep backend memory under ~400 MB to stay within free tier limits.
+- Free tier servers sleep — design endpoints to handle cold starts (fast startup, lazy init).
