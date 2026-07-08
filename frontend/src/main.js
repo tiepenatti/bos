@@ -15,8 +15,78 @@ const framesGrid     = document.getElementById('frames-grid')
 const downloadZipBtn = document.getElementById('download-zip-btn')
 const errorBanner    = document.getElementById('error-banner')
 
+// Player refs
+const playerImg      = document.getElementById('player-img')
+const playerCaption  = document.getElementById('player-caption')
+const playerScrub    = document.getElementById('player-scrub')
+const playerPrev     = document.getElementById('player-prev')
+const playerNext     = document.getElementById('player-next')
+const playerPlay     = document.getElementById('player-play')
+const playerCounter  = document.getElementById('player-counter')
+const playerFpsSel   = document.getElementById('player-fps-select')
+const playerLoop     = document.getElementById('player-loop-check')
+
 let selectedFile = null
 let currentJobId = null
+
+// ── Parameter controls ──────────────────────────────────────────────────────
+// Maps a param id -> how to read it from its <input>/<select>.
+const PARAM_IDS = [
+  'method', 'detector', 'max_features', 'match_ratio',
+  'flow_max_corners', 'flow_quality', 'flow_win_size',
+  'ransac_thresh', 'gain', 'blur_ksize', 'threshold', 'morph_ksize',
+  'overlay', 'colormap', 'normalize', 'num_pairs', 'frame_step',
+]
+
+// Live-update the <output> next to each range slider.
+for (const id of PARAM_IDS) {
+  const el = document.getElementById(`p-${id}`)
+  const out = document.getElementById(`o-${id}`)
+  if (!el) continue
+  if (out) {
+    const sync = () => {
+      out.textContent = id === 'overlay'
+        ? `${Math.round(Number(el.value) * 100)}%`
+        : el.value
+    }
+    el.addEventListener('input', sync)
+    sync()
+  }
+}
+
+// Show only the controls relevant to the selected motion-estimation method.
+const methodSelect = document.getElementById('p-method')
+function syncMethodGroups() {
+  const method = methodSelect.value
+  document.querySelectorAll('.method-group').forEach((g) => {
+    g.classList.toggle('hidden', g.dataset.method !== method)
+  })
+}
+methodSelect.addEventListener('change', syncMethodGroups)
+syncMethodGroups()
+
+function collectParams() {
+  const val = (id) => document.getElementById(`p-${id}`)
+  return {
+    method: val('method').value,
+    detector: val('detector').value,
+    max_features: Number(val('max_features').value),
+    match_ratio: Number(val('match_ratio').value),
+    flow_max_corners: Number(val('flow_max_corners').value),
+    flow_quality: Number(val('flow_quality').value),
+    flow_win_size: Number(val('flow_win_size').value),
+    ransac_thresh: Number(val('ransac_thresh').value),
+    gain: Number(val('gain').value),
+    blur_ksize: Number(val('blur_ksize').value),
+    threshold: Number(val('threshold').value),
+    morph_ksize: Number(val('morph_ksize').value),
+    overlay: Number(val('overlay').value),
+    colormap: val('colormap').value,
+    normalize: val('normalize').checked,
+    num_pairs: Number(val('num_pairs').value),
+    frame_step: Number(val('frame_step').value),
+  }
+}
 
 // ── File selection ────────────────────────────────────────────────────────────
 dropZone.addEventListener('click', () => fileInput.click())
@@ -67,9 +137,13 @@ uploadBtn.addEventListener('click', async () => {
     const { job_id } = await uploadRes.json()
     currentJobId = job_id
 
-    // 2. Trigger processing
-    showProgress('Processing with OpenCV…', 40)
-    const processRes = await fetch(`${API_URL}/api/process/${job_id}`, { method: 'POST' })
+    // 2. Trigger processing with the chosen BOS parameters
+    showProgress('Computing schlieren…', 40)
+    const processRes = await fetch(`${API_URL}/api/process/${job_id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(collectParams()),
+    })
     if (!processRes.ok) throw new Error(await processRes.text())
 
     // 3. Poll for results
@@ -109,21 +183,115 @@ function renderResults(results) {
     window.open(`${API_URL}/api/download/${currentJobId}`, '_blank')
   }
 
+  // Frame-by-frame player
+  initPlayer(results.extracted_frames ?? [])
+
   // Frames
   framesGrid.innerHTML = ''
   for (const frame of results.extracted_frames ?? []) {
+    const s = frame.stats ?? {}
+    const alignBadge = s.aligned === false
+      ? `<span class="badge warn" title="No reliable homography — showing raw diff">unaligned</span>`
+      : `<span class="badge ok" title="${s.inliers ?? '?'} RANSAC inliers">aligned</span>`
     const card = document.createElement('div')
     card.className = 'frame-card'
     card.innerHTML = `
       <img src="${API_URL}/api/frames/${currentJobId}/${frame.index}" alt="Frame ${frame.index}" loading="lazy" />
       <div class="frame-label">
-        <span>#${frame.index} · ${formatTimestamp(frame.timestamp_ms)}</span>
-        <a href="${API_URL}/api/frames/${currentJobId}/${frame.index}" download="frame_${frame.index}.jpg">↓</a>
+        <span>${frame.prev_index ?? '?'}→${frame.index} · ${formatTimestamp(frame.timestamp_ms)}</span>
+        <a href="${API_URL}/api/frames/${currentJobId}/${frame.index}" download="schlieren_${frame.index}.jpg">↓</a>
       </div>
+      <div class="frame-meta">${alignBadge}<span>${s.inliers ?? 0} inliers</span></div>
     `
     framesGrid.appendChild(card)
   }
 }
+
+// ── Frame-by-frame player ─────────────────────────────────────────────────────
+let playerFrames = []
+let playerIndex = 0
+let playerTimer = null
+
+function initPlayer(frames) {
+  stopPlayback()
+  playerFrames = frames
+  playerIndex = 0
+
+  if (!frames.length) {
+    document.getElementById('player').classList.add('hidden')
+    return
+  }
+  document.getElementById('player').classList.remove('hidden')
+
+  // Preload all frame images so playback is smooth.
+  for (const f of frames) {
+    const img = new Image()
+    img.src = frameUrl(f.index)
+  }
+
+  playerScrub.max = String(frames.length - 1)
+  playerScrub.value = '0'
+  showFrame(0)
+}
+
+function frameUrl(index) {
+  return `${API_URL}/api/frames/${currentJobId}/${index}`
+}
+
+function showFrame(i) {
+  if (!playerFrames.length) return
+  playerIndex = (i + playerFrames.length) % playerFrames.length
+  const f = playerFrames[playerIndex]
+  playerImg.src = frameUrl(f.index)
+  playerScrub.value = String(playerIndex)
+  playerCounter.textContent = `${playerIndex + 1} / ${playerFrames.length}`
+  const aligned = f.stats?.aligned === false ? 'unaligned' : 'aligned'
+  playerCaption.textContent =
+    `${f.prev_index ?? '?'}→${f.index} · ${formatTimestamp(f.timestamp_ms)} · ${aligned}`
+}
+
+function stepFrame(delta) {
+  const next = playerIndex + delta
+  // When stepping manually past the end without loop, clamp instead of wrapping.
+  if (!playerLoop.checked && (next < 0 || next >= playerFrames.length)) {
+    showFrame(Math.max(0, Math.min(playerFrames.length - 1, next)))
+    return
+  }
+  showFrame(next)
+}
+
+function startPlayback() {
+  if (!playerFrames.length) return
+  const fps = Number(playerFpsSel.value) || 10
+  playerPlay.textContent = '⏸ Pause'
+  playerTimer = setInterval(() => {
+    const atEnd = playerIndex >= playerFrames.length - 1
+    if (atEnd && !playerLoop.checked) {
+      stopPlayback()
+      return
+    }
+    showFrame(playerIndex + 1)
+  }, 1000 / fps)
+}
+
+function stopPlayback() {
+  if (playerTimer) {
+    clearInterval(playerTimer)
+    playerTimer = null
+  }
+  playerPlay.textContent = '▶ Play'
+}
+
+function togglePlayback() {
+  if (playerTimer) stopPlayback()
+  else startPlayback()
+}
+
+playerPlay.addEventListener('click', togglePlayback)
+playerPrev.addEventListener('click', () => { stopPlayback(); stepFrame(-1) })
+playerNext.addEventListener('click', () => { stopPlayback(); stepFrame(1) })
+playerScrub.addEventListener('input', () => { stopPlayback(); showFrame(Number(playerScrub.value)) })
+playerFpsSel.addEventListener('change', () => { if (playerTimer) { stopPlayback(); startPlayback() } })
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function showProgress(label, pct) {

@@ -18,18 +18,20 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import numpy as np
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from bos import BOSParams, compute_schlieren
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", 3600))
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", 900))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 200 * 1024 * 1024))
 
-# Number of frames to extract evenly across the video
+# Number of frame *pairs* to process evenly across the video
 FRAMES_TO_EXTRACT = int(os.getenv("FRAMES_TO_EXTRACT", 12))
 
 TMP_ROOT = Path(tempfile.gettempdir()) / "bos_jobs"
@@ -73,6 +75,48 @@ def cleanup_stale_jobs() -> None:
             uploaded_at = d.stat().st_mtime
         if uploaded_at < cutoff:
             shutil.rmtree(d, ignore_errors=True)
+
+
+# ── Request models ─────────────────────────────────────────────────────────────
+
+class ProcessRequest(BaseModel):
+    """BOS pipeline parameters plus frame-sampling controls. Every field is
+    optional so `POST /api/process/{job_id}` works with an empty body."""
+
+    # Motion estimation
+    method: str = "features"                # "features" | "optical_flow"
+    detector: str = "orb"                   # "orb" | "akaze" | "sift"
+    max_features: int = 2000
+    match_ratio: float = 0.75
+    min_matches: int = 12
+    flow_max_corners: int = 600
+    flow_quality: float = 0.01
+    flow_min_distance: float = 7.0
+    flow_win_size: int = 21
+    ransac_thresh: float = 4.0
+
+    # Schlieren post-processing
+    blur_ksize: int = 5
+    gain: float = 4.0
+    threshold: int = 8
+    morph_ksize: int = 3
+    normalize: bool = True
+    colormap: str = "inferno"
+    overlay: float = 0.0
+    border_erode: int = 5
+
+    # Frame sampling
+    num_pairs: int = Field(default=FRAMES_TO_EXTRACT, ge=1, le=200)
+    frame_step: int = Field(default=1, ge=1, le=100)  # gap between prev & curr
+
+    def to_bos_params(self) -> BOSParams:
+        keys = {
+            "method", "detector", "max_features", "match_ratio", "min_matches",
+            "flow_max_corners", "flow_quality", "flow_min_distance", "flow_win_size",
+            "ransac_thresh", "blur_ksize", "gain", "threshold", "morph_ksize",
+            "normalize", "colormap", "overlay", "border_erode",
+        }
+        return BOSParams(**{k: getattr(self, k) for k in keys})
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -145,8 +189,15 @@ async def upload_video(
 
 
 @app.post("/api/process/{job_id}")
-def process_video(job_id: str) -> dict:
-    """Run OpenCV processing on the uploaded video and save results + frames."""
+def process_video(
+    job_id: str,
+    params: ProcessRequest = Body(default_factory=ProcessRequest),
+) -> dict:
+    """Run the Background-Oriented Schlieren pipeline on consecutive frame pairs.
+
+    For each sampled anchor frame we grab the frame `frame_step` positions
+    earlier, align the two (cancelling camera motion), take their absdiff, and
+    post-process the result into a schlieren visualization."""
     d = require_job(job_id)
 
     # Find the input video
@@ -154,6 +205,8 @@ def process_video(job_id: str) -> dict:
     if not input_files:
         raise HTTPException(status_code=404, detail="Input video not found")
     video_path = str(input_files[0])
+
+    bos_params = params.to_bos_params()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -166,28 +219,44 @@ def process_video(job_id: str) -> dict:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         duration_seconds = (frame_count / fps) if fps > 0 else 0
 
+        # Clear any prior run's frames so stale results don't linger.
         frames_dir = d / "frames"
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir, ignore_errors=True)
         frames_dir.mkdir(exist_ok=True)
 
-        # Select evenly-spaced frame indices to extract
-        n = min(FRAMES_TO_EXTRACT, frame_count)
-        indices = [int(i * frame_count / n) for i in range(n)] if n > 0 else []
+        step = params.frame_step
+        # Select evenly-spaced anchor (current) frame indices. Each anchor must
+        # have a valid previous frame `step` positions earlier.
+        n = min(params.num_pairs, max(0, frame_count - step))
+        if n > 0:
+            span = frame_count - step
+            anchors = [step + int(i * span / n) for i in range(n)]
+        else:
+            anchors = []
 
         extracted: list[dict[str, Any]] = []
-        for idx in indices:
+        for idx in anchors:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx - step)
+            ok_prev, prev_frame = cap.read()
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret:
+            ok_curr, curr_frame = cap.read()
+            if not ok_prev or not ok_curr:
                 continue
 
-            # ── OpenCV processing per frame (extend this section) ──────────────
-            processed = apply_processing(frame)
-            # ───────────────────────────────────────────────────────────────────
+            vis, stats = compute_schlieren(prev_frame, curr_frame, bos_params)
 
             out_path = frames_dir / f"frame_{idx:06d}.jpg"
-            cv2.imwrite(str(out_path), processed)
+            cv2.imwrite(str(out_path), vis)
             timestamp_ms = (idx / fps * 1000) if fps > 0 else 0
-            extracted.append({"index": idx, "timestamp_ms": round(timestamp_ms, 1)})
+            extracted.append(
+                {
+                    "index": idx,
+                    "prev_index": idx - step,
+                    "timestamp_ms": round(timestamp_ms, 1),
+                    "stats": stats,
+                }
+            )
 
     finally:
         cap.release()
@@ -199,28 +268,12 @@ def process_video(job_id: str) -> dict:
         "width": width,
         "height": height,
         "duration_seconds": round(duration_seconds, 2),
+        "params": params.model_dump(),
         "extracted_frames": extracted,
         "processed_at": time.time(),
     }
     (d / "results.json").write_text(json.dumps(results))
     return results
-
-
-def apply_processing(frame: np.ndarray) -> np.ndarray:
-    """
-    Apply OpenCV processing to a single frame.
-    Extend or replace this function with your desired pipeline.
-
-    Current default: Canny edge detection overlaid on the original frame.
-    """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, threshold1=50, threshold2=150)
-    # Build a green-channel-only BGR image from the edge mask (stays uint8)
-    empty = np.zeros_like(edges)
-    edges_green = cv2.merge([empty, edges, empty])
-    # Blend edges (green tint) with original
-    overlay = cv2.addWeighted(frame, 0.7, edges_green, 0.3, 0)
-    return overlay
 
 
 @app.get("/api/results/{job_id}")

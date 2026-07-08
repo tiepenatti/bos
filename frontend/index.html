@@ -24,6 +24,95 @@
             <input type="file" id="file-input" accept="video/*" hidden />
           </div>
           <div id="file-info" class="file-info hidden"></div>
+
+          <!-- BOS parameters -->
+          <details id="params-panel" class="params">
+            <summary>⚙ Schlieren settings</summary>
+
+            <div class="params-grid">
+              <h4 class="params-heading">Background motion</h4>
+
+              <label>Method
+                <select id="p-method">
+                  <option value="features">Features (keypoints)</option>
+                  <option value="optical_flow">Optical flow (LK)</option>
+                </select>
+              </label>
+
+              <div class="method-group" data-method="features">
+                <label>Detector
+                  <select id="p-detector">
+                    <option value="orb">ORB (fast)</option>
+                    <option value="sift">SIFT (accurate)</option>
+                  </select>
+                </label>
+                <label>Max features <output id="o-max_features">2000</output>
+                  <input type="range" id="p-max_features" min="200" max="8000" step="100" value="2000" />
+                </label>
+                <label>Match ratio <output id="o-match_ratio">0.75</output>
+                  <input type="range" id="p-match_ratio" min="0.5" max="0.95" step="0.01" value="0.75" />
+                </label>
+              </div>
+
+              <div class="method-group hidden" data-method="optical_flow">
+                <label>Max corners <output id="o-flow_max_corners">600</output>
+                  <input type="range" id="p-flow_max_corners" min="50" max="3000" step="50" value="600" />
+                </label>
+                <label>Quality <output id="o-flow_quality">0.01</output>
+                  <input type="range" id="p-flow_quality" min="0.001" max="0.1" step="0.001" value="0.01" />
+                </label>
+                <label>LK window <output id="o-flow_win_size">21</output>
+                  <input type="range" id="p-flow_win_size" min="5" max="51" step="2" value="21" />
+                </label>
+              </div>
+
+              <label>RANSAC threshold (px) <output id="o-ransac_thresh">4.0</output>
+                <input type="range" id="p-ransac_thresh" min="1" max="15" step="0.5" value="4" />
+              </label>
+
+              <h4 class="params-heading">Schlieren highlight</h4>
+
+              <label>Gain <output id="o-gain">4.0</output>
+                <input type="range" id="p-gain" min="1" max="20" step="0.5" value="4" />
+              </label>
+              <label>Blur kernel <output id="o-blur_ksize">5</output>
+                <input type="range" id="p-blur_ksize" min="0" max="31" step="1" value="5" />
+              </label>
+              <label>Threshold <output id="o-threshold">8</output>
+                <input type="range" id="p-threshold" min="0" max="80" step="1" value="8" />
+              </label>
+              <label>Morph open <output id="o-morph_ksize">3</output>
+                <input type="range" id="p-morph_ksize" min="0" max="15" step="1" value="3" />
+              </label>
+              <label>Overlay on frame <output id="o-overlay">0%</output>
+                <input type="range" id="p-overlay" min="0" max="1" step="0.05" value="0" />
+              </label>
+              <label>Colormap
+                <select id="p-colormap">
+                  <option value="inferno">Inferno</option>
+                  <option value="magma">Magma</option>
+                  <option value="turbo">Turbo</option>
+                  <option value="jet">Jet</option>
+                  <option value="viridis">Viridis</option>
+                  <option value="hot">Hot</option>
+                  <option value="gray">Grayscale</option>
+                </select>
+              </label>
+              <label class="checkbox">
+                <input type="checkbox" id="p-normalize" checked /> Normalize contrast
+              </label>
+
+              <h4 class="params-heading">Frame sampling</h4>
+
+              <label>Pairs to process <output id="o-num_pairs">12</output>
+                <input type="range" id="p-num_pairs" min="1" max="60" step="1" value="12" />
+              </label>
+              <label>Frame step <output id="o-frame_step">1</output>
+                <input type="range" id="p-frame_step" min="1" max="30" step="1" value="1" />
+              </label>
+            </div>
+          </details>
+
           <button id="upload-btn" class="btn primary" disabled>Upload &amp; Process</button>
         </section>
 
@@ -45,6 +134,35 @@
             <button id="download-zip-btn" class="btn primary">⬇ Download All (ZIP)</button>
           </div>
 
+          <!-- Frame-by-frame player -->
+          <h3>Playback</h3>
+          <div id="player" class="player">
+            <div class="player-stage">
+              <img id="player-img" alt="Processed frame" />
+              <div id="player-caption" class="player-caption"></div>
+            </div>
+            <input type="range" id="player-scrub" class="player-scrub" min="0" max="0" value="0" />
+            <div class="player-controls">
+              <button id="player-prev" class="btn secondary" title="Previous frame">⏮</button>
+              <button id="player-play" class="btn primary" title="Play / pause">▶ Play</button>
+              <button id="player-next" class="btn secondary" title="Next frame">⏭</button>
+              <span id="player-counter" class="player-counter">0 / 0</span>
+              <label class="player-fps">
+                Speed
+                <select id="player-fps-select">
+                  <option value="2">2 fps</option>
+                  <option value="5">5 fps</option>
+                  <option value="10" selected>10 fps</option>
+                  <option value="15">15 fps</option>
+                  <option value="24">24 fps</option>
+                </select>
+              </label>
+              <label class="player-loop">
+                <input type="checkbox" id="player-loop-check" checked /> Loop
+              </label>
+            </div>
+          </div>
+
           <h3>Extracted Frames</h3>
           <div id="frames-grid" class="frames-grid"></div>
         </section>
@@ -54,7 +172,7 @@
       </main>
 
       <footer>
-        <p>Files are kept for <strong>1 hour</strong> then deleted automatically.</p>
+        <p>Files are kept for <strong>15 minutes</strong> then deleted automatically.</p>
       </footer>
     </div>
 
