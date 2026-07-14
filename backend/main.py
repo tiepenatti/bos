@@ -14,13 +14,15 @@ import tempfile
 import time
 import uuid
 import zipfile
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from bos import BOSParams, compute_schlieren
@@ -51,6 +53,17 @@ def require_job(job_id: str) -> Path:
     return d
 
 
+# In-memory progress for in-flight processing jobs. Single-process free tier, so
+# a plain dict (guarded by the GIL for these simple assignments) is enough. Lost
+# on restart — the status endpoint falls back to results.json in that case.
+PROGRESS: dict[str, dict[str, Any]] = {}
+
+
+def set_progress(job_id: str, **fields: Any) -> None:
+    entry = PROGRESS.setdefault(job_id, {})
+    entry.update(fields)
+
+
 async def delete_job_after_ttl(job_id: str, ttl: int = JOB_TTL_SECONDS) -> None:
     """Scheduled via BackgroundTasks to clean up job files after TTL.
     Uses asyncio.sleep so uvicorn can cancel it cleanly on reload/shutdown.
@@ -59,6 +72,7 @@ async def delete_job_after_ttl(job_id: str, ttl: int = JOB_TTL_SECONDS) -> None:
     d = job_dir(job_id)
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
+    PROGRESS.pop(job_id, None)
 
 
 def cleanup_stale_jobs() -> None:
@@ -105,9 +119,12 @@ class ProcessRequest(BaseModel):
     overlay: float = 0.0
     border_erode: int = 5
 
-    # Frame sampling
+    # Frame sampling / output
+    # The whole video is processed frame-by-frame into a playable clip.
+    # `num_pairs` only controls how many still thumbnails are saved for the grid.
     num_pairs: int = Field(default=FRAMES_TO_EXTRACT, ge=1, le=200)
     frame_step: int = Field(default=1, ge=1, le=100)  # gap between prev & curr
+    max_width: int = Field(default=960, ge=0, le=3840)  # downscale cap; 0 = original
 
     def to_bos_params(self) -> BOSParams:
         keys = {
@@ -188,92 +205,205 @@ async def upload_video(
     return {"job_id": job_id}
 
 
+def _scaled_size(width: int, height: int, max_width: int) -> tuple[int, int]:
+    """Return (w, h) downscaled so width <= max_width (even dimensions for the
+    video encoder). max_width <= 0 keeps the original size."""
+    if max_width <= 0 or width <= max_width:
+        w, h = width, height
+    else:
+        scale = max_width / width
+        w, h = int(round(width * scale)), int(round(height * scale))
+    # VP8 needs even dimensions.
+    return (w - (w % 2)), (h - (h % 2))
+
+
 @app.post("/api/process/{job_id}")
-def process_video(
+async def process_video(
     job_id: str,
     params: ProcessRequest = Body(default_factory=ProcessRequest),
 ) -> dict:
-    """Run the Background-Oriented Schlieren pipeline on consecutive frame pairs.
+    """Kick off the Background-Oriented Schlieren pipeline as an in-process
+    background task and return immediately. Poll GET /api/status/{job_id} for
+    progress, then GET /api/results/{job_id} once it reports done.
 
-    For each sampled anchor frame we grab the frame `frame_step` positions
-    earlier, align the two (cancelling camera motion), take their absdiff, and
-    post-process the result into a schlieren visualization."""
+    The video is streamed frame-by-frame: each frame is aligned against the frame
+    `frame_step` positions earlier (cancelling camera motion), diffed, and
+    post-processed into a schlieren frame written to an output .webm."""
     d = require_job(job_id)
 
-    # Find the input video
     input_files = list(d.glob("input.*"))
     if not input_files:
         raise HTTPException(status_code=404, detail="Input video not found")
-    video_path = str(input_files[0])
 
+    # Don't start a second run while one is already in flight for this job.
+    existing = PROGRESS.get(job_id)
+    if existing and existing.get("state") in ("queued", "running"):
+        return {"status": "already_running", "job_id": job_id}
+
+    set_progress(
+        job_id,
+        state="queued",
+        percent=0,
+        processed=0,
+        total=None,
+        error=None,
+        started_at=time.time(),
+    )
+    # asyncio.create_task keeps the work in-process (free-tier friendly); the
+    # blocking OpenCV loop runs in a worker thread so the event loop stays free.
+    asyncio.create_task(asyncio.to_thread(_process_job, job_id, params))
+    return {"status": "started", "job_id": job_id}
+
+
+@app.get("/api/status/{job_id}")
+def get_status(job_id: str) -> dict:
+    """Return processing progress for a job. Falls back to results.json when the
+    in-memory entry is missing (e.g. after a server restart)."""
+    d = require_job(job_id)
+    entry = PROGRESS.get(job_id)
+    if entry is not None:
+        return {"job_id": job_id, **entry}
+    if (d / "results.json").exists():
+        return {"job_id": job_id, "state": "done", "percent": 100}
+    return {"job_id": job_id, "state": "unknown", "percent": 0}
+
+
+def _process_job(job_id: str, params: ProcessRequest) -> None:
+    """Blocking worker: encode the full schlieren video, updating PROGRESS as it
+    goes. Runs in a thread; never raises (errors are recorded in PROGRESS)."""
+    d = job_dir(job_id)
+    video_path = str(next(iter(d.glob("input.*"))))
     bos_params = params.to_bos_params()
+    step = params.frame_step
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise HTTPException(status_code=422, detail="Could not open video file")
+        set_progress(job_id, state="error", error="Could not open video file")
+        return
 
+    # Fresh output dir/files each run so stale results don't linger.
+    frames_dir = d / "frames"
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir, ignore_errors=True)
+    frames_dir.mkdir(exist_ok=True)
+    video_out = d / "output.webm"
+    if video_out.exists():
+        video_out.unlink()
+
+    writer: cv2.VideoWriter | None = None
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        out_fps = fps if fps and fps > 0 else 24.0
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         duration_seconds = (frame_count / fps) if fps > 0 else 0
 
-        # Clear any prior run's frames so stale results don't linger.
-        frames_dir = d / "frames"
-        if frames_dir.exists():
-            shutil.rmtree(frames_dir, ignore_errors=True)
-        frames_dir.mkdir(exist_ok=True)
+        out_w, out_h = _scaled_size(width, height, params.max_width)
 
-        step = params.frame_step
-        # Select evenly-spaced anchor (current) frame indices. Each anchor must
-        # have a valid previous frame `step` positions earlier.
-        n = min(params.num_pairs, max(0, frame_count - step))
-        if n > 0:
-            span = frame_count - step
-            anchors = [step + int(i * span / n) for i in range(n)]
-        else:
-            anchors = []
+        # Number of output frames we'll produce, and which of them to snapshot.
+        total_out = max(0, frame_count - step)
+        n_thumbs = min(params.num_pairs, total_out)
+        thumb_positions = (
+            {int(i * (total_out - 1) / max(1, n_thumbs - 1)) for i in range(n_thumbs)}
+            if n_thumbs > 0
+            else set()
+        )
+        set_progress(
+            job_id,
+            state="running",
+            total=(total_out if total_out > 0 else None),
+            processed=0,
+            percent=0,
+        )
 
+        # Ring buffer holding the last (step + 1) frames; buf[0] is `step`
+        # frames behind buf[-1], giving us the (prev, curr) pair.
+        buf: deque[np.ndarray] = deque(maxlen=step + 1)
         extracted: list[dict[str, Any]] = []
-        for idx in anchors:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx - step)
-            ok_prev, prev_frame = cap.read()
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok_curr, curr_frame = cap.read()
-            if not ok_prev or not ok_curr:
-                continue
+        out_idx = 0  # index into the produced output frames
+        src_idx = 0  # index into the source frames
 
-            vis, stats = compute_schlieren(prev_frame, curr_frame, bos_params)
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if (out_w, out_h) != (width, height):
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            buf.append(frame)
 
-            out_path = frames_dir / f"frame_{idx:06d}.jpg"
-            cv2.imwrite(str(out_path), vis)
-            timestamp_ms = (idx / fps * 1000) if fps > 0 else 0
-            extracted.append(
-                {
-                    "index": idx,
-                    "prev_index": idx - step,
-                    "timestamp_ms": round(timestamp_ms, 1),
-                    "stats": stats,
-                }
-            )
+            if len(buf) == step + 1:
+                prev_frame = buf[0]
+                curr_frame = buf[-1]
+                vis, stats = compute_schlieren(prev_frame, curr_frame, bos_params)
 
+                if writer is None:
+                    writer = cv2.VideoWriter(
+                        str(video_out),
+                        cv2.VideoWriter_fourcc(*"VP80"),
+                        out_fps,
+                        (out_w, out_h),
+                    )
+                    if not writer.isOpened():
+                        set_progress(
+                            job_id,
+                            state="error",
+                            error="Could not initialize video encoder (VP8/webm)",
+                        )
+                        return
+                writer.write(vis)
+
+                if out_idx in thumb_positions:
+                    cur_src = src_idx
+                    cv2.imwrite(str(frames_dir / f"frame_{out_idx:06d}.jpg"), vis)
+                    timestamp_ms = (cur_src / fps * 1000) if fps > 0 else 0
+                    extracted.append(
+                        {
+                            "index": out_idx,
+                            "src_index": cur_src,
+                            "prev_index": cur_src - step,
+                            "timestamp_ms": round(timestamp_ms, 1),
+                            "stats": stats,
+                        }
+                    )
+                out_idx += 1
+                # Update progress (cheap; every processed frame).
+                if total_out > 0:
+                    percent = min(99, int(out_idx * 100 / total_out))
+                else:
+                    percent = 0
+                set_progress(job_id, processed=out_idx, percent=percent)
+            src_idx += 1
+
+    except Exception as exc:  # noqa: BLE001 — record any failure for the client
+        set_progress(job_id, state="error", error=f"{exc}")
+        return
     finally:
         cap.release()
+        if writer is not None:
+            writer.release()
 
+    has_video = video_out.exists() and video_out.stat().st_size > 0
     results = {
         "job_id": job_id,
         "fps": fps,
+        "output_fps": out_fps,
         "frame_count": frame_count,
+        "processed_frames": out_idx,
         "width": width,
         "height": height,
+        "output_width": out_w,
+        "output_height": out_h,
         "duration_seconds": round(duration_seconds, 2),
         "params": params.model_dump(),
+        "has_video": has_video,
         "extracted_frames": extracted,
         "processed_at": time.time(),
     }
     (d / "results.json").write_text(json.dumps(results))
-    return results
+    set_progress(
+        job_id, state="done", percent=100, processed=out_idx, total=out_idx
+    )
 
 
 @app.get("/api/results/{job_id}")
@@ -296,6 +426,57 @@ def get_frame(job_id: str, frame_index: int) -> FileResponse:
     return FileResponse(str(frame_path), media_type="image/jpeg")
 
 
+@app.get("/api/video/{job_id}")
+def get_video(job_id: str, request: Request) -> Response:
+    """Serve the processed .webm, honoring HTTP Range requests so the browser
+    <video> element can stream and seek."""
+    d = require_job(job_id)
+    video_path = d / "output.webm"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Processed video not found")
+
+    file_size = video_path.stat().st_size
+    range_header = request.headers.get("range")
+    media_type = "video/webm"
+
+    if range_header is None:
+        return FileResponse(
+            str(video_path),
+            media_type=media_type,
+            headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)},
+        )
+
+    # Parse "bytes=start-end"
+    try:
+        units, _, rng = range_header.partition("=")
+        start_s, _, end_s = rng.partition("-")
+        start = int(start_s) if start_s else 0
+        end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Range header")
+
+    start = max(0, start)
+    end = min(end, file_size - 1)
+    if start > end:
+        raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+
+    chunk_size = end - start + 1
+    with open(video_path, "rb") as f:
+        f.seek(start)
+        data = f.read(chunk_size)
+
+    return Response(
+        content=data,
+        status_code=206,
+        media_type=media_type,
+        headers={
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(chunk_size),
+        },
+    )
+
+
 @app.get("/api/download/{job_id}")
 def download_zip(job_id: str) -> StreamingResponse:
     """Stream a ZIP archive containing all frames and the results JSON."""
@@ -307,6 +488,9 @@ def download_zip(job_id: str) -> StreamingResponse:
             results_file = d / "results.json"
             if results_file.exists():
                 zf.write(results_file, "results.json")
+            video_file = d / "output.webm"
+            if video_file.exists():
+                zf.write(video_file, "schlieren.webm")
             frames_dir = d / "frames"
             if frames_dir.exists():
                 for frame_file in sorted(frames_dir.glob("*.jpg")):

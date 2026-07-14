@@ -25,14 +25,24 @@
           </div>
           <div id="file-info" class="file-info hidden"></div>
 
+          <button id="upload-btn" class="btn primary" disabled>Upload &amp; Process</button>
+        </section>
+
+        <!-- Schlieren settings (shared by first run and re-processing) -->
+        <section id="settings-section" class="card hidden">
+          <h2>Settings</h2>
+
           <!-- BOS parameters -->
-          <details id="params-panel" class="params">
+          <details id="params-panel" class="params" open>
             <summary>⚙ Schlieren settings</summary>
 
             <div class="params-grid">
               <h4 class="params-heading">Background motion</h4>
 
-              <label>Method
+              <label>
+                <span class="label-row">Method
+                  <span class="info" tabindex="0" data-tip="How camera motion between two frames is estimated. 'Features' detects and matches keypoints (robust to rotation/zoom); 'Optical flow' tracks points with Lucas–Kanade (faster, best for small motion). Either way a RANSAC homography is fit to cancel the camera shift so only the schlieren remains.">i</span>
+                </span>
                 <select id="p-method">
                   <option value="features">Features (keypoints)</option>
                   <option value="optical_flow">Optical flow (LK)</option>
@@ -40,80 +50,149 @@
               </label>
 
               <div class="method-group" data-method="features">
-                <label>Detector
+                <label>
+                  <span class="label-row">Detector
+                    <span class="info" tabindex="0" data-tip="Algorithm used to find keypoints. ORB is fast and works well for most videos; SIFT is slower but more accurate and more stable under lighting and scale changes.">i</span>
+                  </span>
                   <select id="p-detector">
                     <option value="orb">ORB (fast)</option>
                     <option value="sift">SIFT (accurate)</option>
                   </select>
                 </label>
-                <label>Max features <output id="o-max_features">2000</output>
+                <label>
+                  <span class="label-row">Max features
+                    <span class="info" tabindex="0" data-tip="Maximum keypoints detected per frame. More features give more matches and a more robust alignment, but cost more time. Typical range: 1000–3000.">i</span>
+                    <output id="o-max_features">2000</output>
+                  </span>
                   <input type="range" id="p-max_features" min="200" max="8000" step="100" value="2000" />
                 </label>
-                <label>Match ratio <output id="o-match_ratio">0.75</output>
+                <label>
+                  <span class="label-row">Match ratio
+                    <span class="info" tabindex="0" data-tip="Lowe's ratio test threshold for accepting a keypoint match. Lower (≈0.6) keeps only confident matches (fewer, cleaner); higher (0.8+) keeps more but risks wrong matches. 0.75 is a solid default.">i</span>
+                    <output id="o-match_ratio">0.75</output>
+                  </span>
                   <input type="range" id="p-match_ratio" min="0.5" max="0.95" step="0.01" value="0.75" />
                 </label>
               </div>
 
               <div class="method-group hidden" data-method="optical_flow">
-                <label>Max corners <output id="o-flow_max_corners">600</output>
+                <label>
+                  <span class="label-row">Max corners
+                    <span class="info" tabindex="0" data-tip="Maximum number of points to track with optical flow. More points give a steadier, more reliable alignment but take longer to compute.">i</span>
+                    <output id="o-flow_max_corners">600</output>
+                  </span>
                   <input type="range" id="p-flow_max_corners" min="50" max="3000" step="50" value="600" />
                 </label>
-                <label>Quality <output id="o-flow_quality">0.01</output>
+                <label>
+                  <span class="label-row">Quality
+                    <span class="info" tabindex="0" data-tip="Minimum corner strength (as a fraction of the strongest corner) for a point to be tracked. Lower finds more but weaker points; higher keeps only strong, reliable corners.">i</span>
+                    <output id="o-flow_quality">0.01</output>
+                  </span>
                   <input type="range" id="p-flow_quality" min="0.001" max="0.1" step="0.001" value="0.01" />
                 </label>
-                <label>LK window <output id="o-flow_win_size">21</output>
+                <label>
+                  <span class="label-row">LK window
+                    <span class="info" tabindex="0" data-tip="Search window size (px) for Lucas–Kanade tracking. Larger windows handle bigger motion but blur fine detail and run slower; smaller windows are precise but only track small motion.">i</span>
+                    <output id="o-flow_win_size">21</output>
+                  </span>
                   <input type="range" id="p-flow_win_size" min="5" max="51" step="2" value="21" />
                 </label>
               </div>
 
-              <label>RANSAC threshold (px) <output id="o-ransac_thresh">4.0</output>
+              <label>
+                <span class="label-row">RANSAC threshold (px)
+                  <span class="info" tabindex="0" data-tip="Maximum reprojection error (pixels) for a matched point to count as an inlier when fitting the camera-motion homography. Lower is stricter and rejects more outliers/moving objects; higher is more tolerant of noise.">i</span>
+                  <output id="o-ransac_thresh">4.0</output>
+                </span>
                 <input type="range" id="p-ransac_thresh" min="1" max="15" step="0.5" value="4" />
               </label>
 
               <h4 class="params-heading">Schlieren highlight</h4>
 
-              <label>Gain <output id="o-gain">4.0</output>
+              <label>
+                <span class="label-row">Gain
+                  <span class="info" tabindex="0" data-tip="Brightness multiplier applied to the frame difference. Higher values amplify faint density gradients (the schlieren shimmer) — but also amplify sensor noise.">i</span>
+                  <output id="o-gain">4.0</output>
+                </span>
                 <input type="range" id="p-gain" min="1" max="20" step="0.5" value="4" />
               </label>
-              <label>Blur kernel <output id="o-blur_ksize">5</output>
+              <label>
+                <span class="label-row">Blur kernel
+                  <span class="info" tabindex="0" data-tip="Gaussian blur size (px, odd) applied before amplification to suppress pixel noise. 0 disables it. Larger values smooth more but soften fine detail.">i</span>
+                  <output id="o-blur_ksize">5</output>
+                </span>
                 <input type="range" id="p-blur_ksize" min="0" max="31" step="1" value="5" />
               </label>
-              <label>Threshold <output id="o-threshold">8</output>
+              <label>
+                <span class="label-row">Threshold
+                  <span class="info" tabindex="0" data-tip="Difference values below this level (0–255) are set to black. Raise it to remove background noise and keep only the stronger signal; 0 keeps everything.">i</span>
+                  <output id="o-threshold">8</output>
+                </span>
                 <input type="range" id="p-threshold" min="0" max="80" step="1" value="8" />
               </label>
-              <label>Morph open <output id="o-morph_ksize">3</output>
+              <label>
+                <span class="label-row">Morph open
+                  <span class="info" tabindex="0" data-tip="Morphological opening kernel size. Removes tiny speckle noise from the result. 0 disables it; larger kernels remove bigger specks but can erase fine wisps.">i</span>
+                  <output id="o-morph_ksize">3</output>
+                </span>
                 <input type="range" id="p-morph_ksize" min="0" max="15" step="1" value="3" />
               </label>
-              <label>Overlay on frame <output id="o-overlay">0%</output>
+              <label>
+                <span class="label-row">Overlay on frame
+                  <span class="info" tabindex="0" data-tip="Blends the schlieren visualization over the original frame. 0% = pure schlieren; higher values show more of the underlying scene for context.">i</span>
+                  <output id="o-overlay">0%</output>
+                </span>
                 <input type="range" id="p-overlay" min="0" max="1" step="0.05" value="0" />
               </label>
-              <label>Colormap
-                <select id="p-colormap">
-                  <option value="inferno">Inferno</option>
-                  <option value="magma">Magma</option>
-                  <option value="turbo">Turbo</option>
-                  <option value="jet">Jet</option>
-                  <option value="viridis">Viridis</option>
-                  <option value="hot">Hot</option>
-                  <option value="gray">Grayscale</option>
-                </select>
+              <label>
+                <span class="label-row">Colormap
+                  <span class="info" tabindex="0" data-tip="Color palette that maps difference intensity to color. Perceptual maps (inferno/magma/viridis) reveal detail evenly; jet/turbo are high-contrast and punchy; grayscale shows raw intensity.">i</span>
+                </span>
+                <div class="cmap-select" id="cmap-select"></div>
+                <input type="hidden" id="p-colormap" value="inferno" />
               </label>
               <label class="checkbox">
-                <input type="checkbox" id="p-normalize" checked /> Normalize contrast
+                <input type="checkbox" id="p-normalize" checked />
+                <span class="label-row">Normalize contrast
+                  <span class="info" tabindex="0" data-tip="Stretches each result frame to use the full brightness range, maximizing visibility of subtle gradients. Can introduce flicker if per-frame intensity varies a lot.">i</span>
+                </span>
               </label>
 
               <h4 class="params-heading">Frame sampling</h4>
 
-              <label>Pairs to process <output id="o-num_pairs">12</output>
+              <label>
+                <span class="label-row">Sample thumbnails
+                  <span class="info" tabindex="0" data-tip="How many still images to save from the processed clip for the results grid. This does not affect the video — the whole clip is always processed.">i</span>
+                  <output id="o-num_pairs">12</output>
+                </span>
                 <input type="range" id="p-num_pairs" min="1" max="60" step="1" value="12" />
               </label>
-              <label>Frame step <output id="o-frame_step">1</output>
+              <label>
+                <span class="label-row">Frame step
+                  <span class="info" tabindex="0" data-tip="Gap (in frames) between the two frames compared. 1 = consecutive frames (smallest motion, subtlest effect). Larger steps compare frames further apart, exaggerating slow changes but adding more camera motion to cancel.">i</span>
+                  <output id="o-frame_step">1</output>
+                </span>
                 <input type="range" id="p-frame_step" min="1" max="30" step="1" value="1" />
+              </label>
+              <label>
+                <span class="label-row">Max resolution (speed)
+                  <span class="info" tabindex="0" data-tip="Frames are downscaled so their width doesn't exceed this before processing. Lower is much faster and produces a smaller output; 'Original' is slowest and most detailed.">i</span>
+                </span>
+                <select id="p-max_width">
+                  <option value="480">480p wide (fastest)</option>
+                  <option value="640">640 wide</option>
+                  <option value="960" selected>960 wide</option>
+                  <option value="1280">1280 wide</option>
+                  <option value="0">Original (slowest)</option>
+                </select>
               </label>
             </div>
           </details>
 
-          <button id="upload-btn" class="btn primary" disabled>Upload &amp; Process</button>
+          <button id="reprocess-btn" class="btn primary hidden">♻ Re-process with new settings</button>
+          <p class="hint reprocess-hint hidden" id="reprocess-hint">
+            Re-runs on the same source video and replaces the current processed video &amp; frames.
+          </p>
         </section>
 
         <!-- Step 2: Progress -->
@@ -134,36 +213,30 @@
             <button id="download-zip-btn" class="btn primary">⬇ Download All (ZIP)</button>
           </div>
 
-          <!-- Frame-by-frame player -->
-          <h3>Playback</h3>
+          <!-- Full processed-video player -->
+          <h3>Processed Video</h3>
           <div id="player" class="player">
             <div class="player-stage">
-              <img id="player-img" alt="Processed frame" />
-              <div id="player-caption" class="player-caption"></div>
+              <video id="player-video" class="player-video" controls loop playsinline></video>
             </div>
-            <input type="range" id="player-scrub" class="player-scrub" min="0" max="0" value="0" />
             <div class="player-controls">
-              <button id="player-prev" class="btn secondary" title="Previous frame">⏮</button>
-              <button id="player-play" class="btn primary" title="Play / pause">▶ Play</button>
-              <button id="player-next" class="btn secondary" title="Next frame">⏭</button>
-              <span id="player-counter" class="player-counter">0 / 0</span>
+              <button id="player-prev" class="btn secondary" title="Previous frame">⏮ Frame</button>
+              <button id="player-next" class="btn secondary" title="Next frame">Frame ⏭</button>
               <label class="player-fps">
                 Speed
-                <select id="player-fps-select">
-                  <option value="2">2 fps</option>
-                  <option value="5">5 fps</option>
-                  <option value="10" selected>10 fps</option>
-                  <option value="15">15 fps</option>
-                  <option value="24">24 fps</option>
+                <select id="player-rate-select">
+                  <option value="0.25">0.25×</option>
+                  <option value="0.5">0.5×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
                 </select>
               </label>
-              <label class="player-loop">
-                <input type="checkbox" id="player-loop-check" checked /> Loop
-              </label>
+              <span id="player-counter" class="player-counter"></span>
             </div>
           </div>
 
-          <h3>Extracted Frames</h3>
+          <h3>Sample Frames</h3>
           <div id="frames-grid" class="frames-grid"></div>
         </section>
 

@@ -6,6 +6,9 @@ const fileInput      = document.getElementById('file-input')
 const fileInfo       = document.getElementById('file-info')
 const uploadBtn      = document.getElementById('upload-btn')
 const uploadSection  = document.getElementById('upload-section')
+const settingsSection= document.getElementById('settings-section')
+const reprocessBtn   = document.getElementById('reprocess-btn')
+const reprocessHint  = document.getElementById('reprocess-hint')
 const progressSection= document.getElementById('progress-section')
 const progressFill   = document.getElementById('progress-fill')
 const progressLabel  = document.getElementById('progress-label')
@@ -16,15 +19,12 @@ const downloadZipBtn = document.getElementById('download-zip-btn')
 const errorBanner    = document.getElementById('error-banner')
 
 // Player refs
-const playerImg      = document.getElementById('player-img')
-const playerCaption  = document.getElementById('player-caption')
-const playerScrub    = document.getElementById('player-scrub')
+const playerEl       = document.getElementById('player')
+const playerVideo    = document.getElementById('player-video')
 const playerPrev     = document.getElementById('player-prev')
 const playerNext     = document.getElementById('player-next')
-const playerPlay     = document.getElementById('player-play')
+const playerRateSel  = document.getElementById('player-rate-select')
 const playerCounter  = document.getElementById('player-counter')
-const playerFpsSel   = document.getElementById('player-fps-select')
-const playerLoop     = document.getElementById('player-loop-check')
 
 let selectedFile = null
 let currentJobId = null
@@ -35,7 +35,7 @@ const PARAM_IDS = [
   'method', 'detector', 'max_features', 'match_ratio',
   'flow_max_corners', 'flow_quality', 'flow_win_size',
   'ransac_thresh', 'gain', 'blur_ksize', 'threshold', 'morph_ksize',
-  'overlay', 'colormap', 'normalize', 'num_pairs', 'frame_step',
+  'overlay', 'colormap', 'normalize', 'num_pairs', 'frame_step', 'max_width',
 ]
 
 // Live-update the <output> next to each range slider.
@@ -65,6 +65,86 @@ function syncMethodGroups() {
 methodSelect.addEventListener('change', syncMethodGroups)
 syncMethodGroups()
 
+// ── Custom colormap dropdown ──────────────────────────────────────────────────
+// A non-native dropdown so each option can preview its palette as a gradient.
+// The chosen value is mirrored into the hidden #p-colormap input that
+// collectParams() reads, so the rest of the code is unchanged.
+const COLORMAPS = [
+  { value: 'inferno', label: 'Inferno' },
+  { value: 'magma',   label: 'Magma' },
+  { value: 'turbo',   label: 'Turbo' },
+  { value: 'jet',     label: 'Jet' },
+  { value: 'viridis', label: 'Viridis' },
+  { value: 'hot',     label: 'Hot' },
+  { value: 'gray',    label: 'Grayscale' },
+]
+
+function initColormapSelect() {
+  const root = document.getElementById('cmap-select')
+  const hidden = document.getElementById('p-colormap')
+  if (!root || !hidden) return
+
+  root.innerHTML = `
+    <button type="button" class="cmap-trigger" aria-haspopup="listbox" aria-expanded="false">
+      <span class="cmap-swatch" data-cmap=""></span>
+      <span class="cmap-name"></span>
+      <span class="cmap-caret" aria-hidden="true">▾</span>
+    </button>
+    <ul class="cmap-menu" role="listbox"></ul>
+  `
+  const trigger = root.querySelector('.cmap-trigger')
+  const menu = root.querySelector('.cmap-menu')
+  const swatch = root.querySelector('.cmap-swatch')
+  const nameEl = root.querySelector('.cmap-name')
+
+  menu.innerHTML = COLORMAPS.map(
+    (c) => `
+    <li class="cmap-option" role="option" data-value="${c.value}" tabindex="-1">
+      <span class="cmap-swatch" data-cmap="${c.value}"></span>
+      <span class="cmap-name">${c.label}</span>
+    </li>`
+  ).join('')
+
+  const setValue = (value) => {
+    const cm = COLORMAPS.find((c) => c.value === value) ?? COLORMAPS[0]
+    hidden.value = cm.value
+    swatch.dataset.cmap = cm.value
+    nameEl.textContent = cm.label
+    menu.querySelectorAll('.cmap-option').forEach((o) => {
+      o.setAttribute('aria-selected', String(o.dataset.value === cm.value))
+    })
+  }
+
+  const closeMenu = () => {
+    root.classList.remove('open')
+    trigger.setAttribute('aria-expanded', 'false')
+  }
+  const openMenu = () => {
+    root.classList.add('open')
+    trigger.setAttribute('aria-expanded', 'true')
+  }
+
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation()
+    root.classList.contains('open') ? closeMenu() : openMenu()
+  })
+  menu.querySelectorAll('.cmap-option').forEach((opt) => {
+    opt.addEventListener('click', () => {
+      setValue(opt.dataset.value)
+      closeMenu()
+    })
+  })
+  document.addEventListener('click', (e) => {
+    if (!root.contains(e.target)) closeMenu()
+  })
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeMenu()
+  })
+
+  setValue(hidden.value || 'inferno')
+}
+initColormapSelect()
+
 function collectParams() {
   const val = (id) => document.getElementById(`p-${id}`)
   return {
@@ -85,6 +165,7 @@ function collectParams() {
     normalize: val('normalize').checked,
     num_pairs: Number(val('num_pairs').value),
     frame_step: Number(val('frame_step').value),
+    max_width: Number(val('max_width').value),
   }
 }
 
@@ -110,22 +191,22 @@ function setFile(file) {
   fileInfo.textContent = `${file.name} — ${formatBytes(file.size)}`
   fileInfo.classList.remove('hidden')
   uploadBtn.disabled = false
+  settingsSection.classList.remove('hidden')
   clearError()
 }
 
 // ── Upload & process ──────────────────────────────────────────────────────────
 uploadBtn.addEventListener('click', async () => {
   if (!selectedFile) return
-  uploadBtn.disabled = true
   clearError()
+  setBusy(true)
 
   showProgress('Uploading…', 10)
-  uploadSection.classList.add('hidden')
   progressSection.classList.remove('hidden')
   resultsSection.classList.add('hidden')
 
   try {
-    // 1. Upload
+    // Upload the source, then process it.
     const formData = new FormData()
     formData.append('file', selectedFile)
 
@@ -137,32 +218,99 @@ uploadBtn.addEventListener('click', async () => {
     const { job_id } = await uploadRes.json()
     currentJobId = job_id
 
-    // 2. Trigger processing with the chosen BOS parameters
-    showProgress('Computing schlieren…', 40)
-    const processRes = await fetch(`${API_URL}/api/process/${job_id}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(collectParams()),
-    })
-    if (!processRes.ok) throw new Error(await processRes.text())
-
-    // 3. Poll for results
-    showProgress('Fetching results…', 80)
-    const resultsRes = await fetch(`${API_URL}/api/results/${job_id}`)
-    if (!resultsRes.ok) throw new Error(await resultsRes.text())
-    const results = await resultsRes.json()
-
-    showProgress('Done!', 100)
-    await sleep(400)
-
-    renderResults(results)
+    await runProcessing(job_id)
   } catch (err) {
-    progressSection.classList.add('hidden')
-    uploadSection.classList.remove('hidden')
-    uploadBtn.disabled = false
-    showError(`Error: ${err.message}`)
+    onProcessError(err)
   }
 })
+
+// ── Re-process the same source with the current settings ───────────────────────
+reprocessBtn.addEventListener('click', async () => {
+  if (!currentJobId) return
+  clearError()
+  setBusy(true)
+  resultsSection.classList.add('hidden')
+  progressSection.classList.remove('hidden')
+  try {
+    await runProcessing(currentJobId)
+  } catch (err) {
+    onProcessError(err)
+  }
+})
+
+// Shared pipeline: (re)process an existing job, poll progress, render results.
+// Re-processing replaces the previously generated video/frames server-side.
+async function runProcessing(jobId) {
+  showProgress('Starting…', 0)
+  const processRes = await fetch(`${API_URL}/api/process/${jobId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(collectParams()),
+  })
+  if (!processRes.ok) throw new Error(await processRes.text())
+
+  await pollUntilDone(jobId)
+
+  const resultsRes = await fetch(`${API_URL}/api/results/${jobId}`)
+  if (!resultsRes.ok) throw new Error(await resultsRes.text())
+  const results = await resultsRes.json()
+
+  showProgress('Done!', 100)
+  await sleep(300)
+
+  renderResults(results)
+  // Now that a result exists, expose the re-process action.
+  reprocessBtn.classList.remove('hidden')
+  reprocessHint.classList.remove('hidden')
+  setBusy(false)
+}
+
+function onProcessError(err) {
+  progressSection.classList.add('hidden')
+  uploadSection.classList.remove('hidden')
+  setBusy(false)
+  showError(`Error: ${err.message}`)
+}
+
+// Disable the action buttons while a job is in flight.
+function setBusy(busy) {
+  uploadBtn.disabled = busy || !selectedFile
+  reprocessBtn.disabled = busy
+}
+
+// ── Status polling ────────────────────────────────────────────────────────────
+async function pollUntilDone(jobId) {
+  while (true) {
+    let status
+    try {
+      const res = await fetch(`${API_URL}/api/status/${jobId}`)
+      if (!res.ok) throw new Error(await res.text())
+      status = await res.json()
+    } catch {
+      // Transient network / cold-start hiccup — retry shortly.
+      await sleep(800)
+      continue
+    }
+
+    if (status.state === 'error') {
+      throw new Error(status.error || 'Processing failed')
+    }
+    if (status.state === 'done') {
+      showProgress('Finalizing…', 100)
+      return
+    }
+
+    const pct = Math.max(0, Math.min(100, status.percent ?? 0))
+    if (status.state === 'queued') {
+      showProgress('Queued…', 2)
+    } else if (status.total) {
+      showProgress(`Processing frame ${status.processed ?? 0} / ${status.total} · ${pct}%`, pct)
+    } else {
+      showProgress(`Processing… ${status.processed ?? 0} frames`, pct)
+    }
+    await sleep(500)
+  }
+}
 
 // ── Results rendering ─────────────────────────────────────────────────────────
 function renderResults(results) {
@@ -183,8 +331,8 @@ function renderResults(results) {
     window.open(`${API_URL}/api/download/${currentJobId}`, '_blank')
   }
 
-  // Frame-by-frame player
-  initPlayer(results.extracted_frames ?? [])
+  // Full processed-video player
+  initPlayer(results)
 
   // Frames
   framesGrid.innerHTML = ''
@@ -207,91 +355,48 @@ function renderResults(results) {
   }
 }
 
-// ── Frame-by-frame player ─────────────────────────────────────────────────────
-let playerFrames = []
-let playerIndex = 0
-let playerTimer = null
+// ── Processed-video player ────────────────────────────────────────────────────
+let playerFps = 24
 
-function initPlayer(frames) {
-  stopPlayback()
-  playerFrames = frames
-  playerIndex = 0
+function initPlayer(results) {
+  playerFps = results.output_fps || results.fps || 24
 
-  if (!frames.length) {
-    document.getElementById('player').classList.add('hidden')
+  if (!results.has_video) {
+    playerEl.classList.add('hidden')
     return
   }
-  document.getElementById('player').classList.remove('hidden')
+  playerEl.classList.remove('hidden')
 
-  // Preload all frame images so playback is smooth.
-  for (const f of frames) {
-    const img = new Image()
-    img.src = frameUrl(f.index)
+  // Cache-bust so a re-processed job doesn't show the previous render.
+  playerVideo.src = `${API_URL}/api/video/${currentJobId}?t=${Date.now()}`
+  playerVideo.playbackRate = Number(playerRateSel.value) || 1
+  playerVideo.load()
+  updatePlayerCounter(results)
+}
+
+function updatePlayerCounter(results) {
+  const total = results.processed_frames ?? 0
+  const dur = total > 0 && playerFps ? (total / playerFps).toFixed(1) : '?'
+  const setText = () => {
+    const cur = Math.round((playerVideo.currentTime || 0) * playerFps)
+    playerCounter.textContent = `frame ${Math.min(cur + 1, total)} / ${total} · ${dur}s`
   }
-
-  playerScrub.max = String(frames.length - 1)
-  playerScrub.value = '0'
-  showFrame(0)
+  playerVideo.ontimeupdate = setText
+  setText()
 }
 
-function frameUrl(index) {
-  return `${API_URL}/api/frames/${currentJobId}/${index}`
+function stepVideoFrame(delta) {
+  playerVideo.pause()
+  const dt = 1 / (playerFps || 24)
+  const t = (playerVideo.currentTime || 0) + delta * dt
+  playerVideo.currentTime = Math.max(0, Math.min(playerVideo.duration || t, t))
 }
 
-function showFrame(i) {
-  if (!playerFrames.length) return
-  playerIndex = (i + playerFrames.length) % playerFrames.length
-  const f = playerFrames[playerIndex]
-  playerImg.src = frameUrl(f.index)
-  playerScrub.value = String(playerIndex)
-  playerCounter.textContent = `${playerIndex + 1} / ${playerFrames.length}`
-  const aligned = f.stats?.aligned === false ? 'unaligned' : 'aligned'
-  playerCaption.textContent =
-    `${f.prev_index ?? '?'}→${f.index} · ${formatTimestamp(f.timestamp_ms)} · ${aligned}`
-}
-
-function stepFrame(delta) {
-  const next = playerIndex + delta
-  // When stepping manually past the end without loop, clamp instead of wrapping.
-  if (!playerLoop.checked && (next < 0 || next >= playerFrames.length)) {
-    showFrame(Math.max(0, Math.min(playerFrames.length - 1, next)))
-    return
-  }
-  showFrame(next)
-}
-
-function startPlayback() {
-  if (!playerFrames.length) return
-  const fps = Number(playerFpsSel.value) || 10
-  playerPlay.textContent = '⏸ Pause'
-  playerTimer = setInterval(() => {
-    const atEnd = playerIndex >= playerFrames.length - 1
-    if (atEnd && !playerLoop.checked) {
-      stopPlayback()
-      return
-    }
-    showFrame(playerIndex + 1)
-  }, 1000 / fps)
-}
-
-function stopPlayback() {
-  if (playerTimer) {
-    clearInterval(playerTimer)
-    playerTimer = null
-  }
-  playerPlay.textContent = '▶ Play'
-}
-
-function togglePlayback() {
-  if (playerTimer) stopPlayback()
-  else startPlayback()
-}
-
-playerPlay.addEventListener('click', togglePlayback)
-playerPrev.addEventListener('click', () => { stopPlayback(); stepFrame(-1) })
-playerNext.addEventListener('click', () => { stopPlayback(); stepFrame(1) })
-playerScrub.addEventListener('input', () => { stopPlayback(); showFrame(Number(playerScrub.value)) })
-playerFpsSel.addEventListener('change', () => { if (playerTimer) { stopPlayback(); startPlayback() } })
+playerPrev.addEventListener('click', () => stepVideoFrame(-1))
+playerNext.addEventListener('click', () => stepVideoFrame(1))
+playerRateSel.addEventListener('change', () => {
+  playerVideo.playbackRate = Number(playerRateSel.value) || 1
+})
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function showProgress(label, pct) {

@@ -43,3 +43,4 @@ desktop.ini
 # IDE
 .idea/
 *.iml
+/.test-files/*
